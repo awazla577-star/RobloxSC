@@ -1,6 +1,6 @@
 -- ================================================================
---  🐜 ANTS TEAM v4.1 | ANDROID EDITION
---  Close = Minimize (bukan exit) | Floating icon untuk open/close
+--  🐜 ANTS TEAM v4.2 | ANDROID EDITION | FULL FEATURES
+--  Fix: tombol open/close | Anti-Hit Smart | Auto Steal | dll
 -- ================================================================
 
 local Players          = game:GetService("Players")
@@ -8,6 +8,7 @@ local RunService       = game:GetService("RunService")
 local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Lighting         = game:GetService("Lighting")
+local Stats            = game:GetService("Stats")
 
 local LP     = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
@@ -16,15 +17,25 @@ local Camera = workspace.CurrentCamera
 -- STATE
 -- ================================================================
 local S = {
-    AntiHit=false, AntiHitRange=30,
-    FreezeMister=false, Godmode=false, AntiTouch=false,
-    SpeedHack=false, SpeedValue=24, CurrentSpeed=16, TargetSpeed=16,
-    NoClip=false, InfJump=false, AutoTP=false, AutoSteal=false,
-    EggESP=false, MisterESP=false,
-    LowGfx=false, Visible=true,
-    ReachEnabled=true,
+    -- Combat
+    AntiHit=false, AntiHitRange=35, AntiHitMode="Dodge", -- Dodge/Teleport/Freeze
+    Godmode=false, AntiTouch=false, AntiVoid=false,
+    FreezeMister=false, KillAura=false, KillAuraRange=8,
+    -- Player
+    SpeedHack=false, SpeedValue=24, CurrentSpeed=16, TargetSpeed=16, SpeedMode="Bypass",
+    JumpPower=false, JumpValue=80,
+    NoClip=false, InfJump=false, Fly=false, FlySpeed=50,
+    -- Steal
+    AutoSteal=false, AutoStealDist=120, ReachEnabled=true, AutoTP=false,
+    AutoCollectAll=false,
+    -- ESP
+    EggESP=false, MisterESP=false, PlayerESP=false, Tracers=false,
+    Fullbright=false,
+    -- Misc
+    LowGfx=false, NoFog=false, HideChat=false,
+    Visible=true, Minimized=false,
     EggsStart=0, SessionStart=tick(),
-    Minimized=false,
+    _mtPatched=false,
 }
 
 -- ================================================================
@@ -32,14 +43,16 @@ local S = {
 -- ================================================================
 pcall(function()
     local t = (gethui and gethui()) or LP.PlayerGui
-    local old = t:FindFirstChild("ANTS_V41")
-    if old then old:Destroy() end
+    for _, n in ipairs({"ANTS_V41","ANTS_V42","ANTS_V4"}) do
+        local o = t:FindFirstChild(n)
+        if o then o:Destroy() end
+    end
 end)
 
 -- ================================================================
 -- CACHE
 -- ================================================================
-local Cache = {Eggs={}, Misters={}, Base=nil, EggT=0, MisT=0, BaseT=0}
+local Cache = {Eggs={}, Misters={}, Base=nil, EggT=0, MisT=0, BaseT=0, Players={}}
 
 local function ScanEggs()
     if tick() - Cache.EggT < 2 then return Cache.Eggs end
@@ -58,7 +71,7 @@ local function ScanMisters()
     local l = {}
     for _, o in ipairs(workspace:GetDescendants()) do
         local n = o.Name:lower()
-        if o:IsA("Model") and (n:find("mister") or n:find("mr%.") or n:find("enemy") or n:find("boss") or n:find("chaser")) then
+        if o:IsA("Model") and (n:find("mister") or n:find("mr%.") or n:find("enemy") or n:find("boss") or n:find("chaser") or n:find("monster")) then
             local hrp = o:FindFirstChild("HumanoidRootPart")
             local hum = o:FindFirstChildOfClass("Humanoid")
             if hrp and hum and hum.Health > 0 then
@@ -117,7 +130,7 @@ local function FormatTime(s)
 end
 
 -- ================================================================
--- PROXIMITY PROMPT (steal dari jauh)
+-- PROXIMITY PROMPT
 -- ================================================================
 local function FindPrompt(obj)
     if not obj then return nil end
@@ -152,10 +165,104 @@ local function FirePrompt(pp)
 end
 
 -- ================================================================
--- GUI
+-- ANTI-HIT SMART (dodge + i-frame + teleport)
+-- ================================================================
+local AntiHitLastTP = 0
+
+local function DoAntiHit()
+    if not S.AntiHit then return end
+    local hrp = GetHRP(); if not hrp then return end
+
+    local misters = ScanMisters()
+    local nearest, nd = nil, math.huge
+    for _, m in ipairs(misters) do
+        if m.hrp and m.hrp.Parent then
+            local d = (m.hrp.Position - hrp.Position).Magnitude
+            if d < nd then nd = d; nearest = m end
+        end
+    end
+
+    if not nearest or nd > S.AntiHitRange then return end
+
+    if S.AntiHitMode == "Dodge" then
+        -- Push away (soft dodge)
+        local dir = (hrp.Position - nearest.hrp.Position).Unit
+        local push = (S.AntiHitRange - nd + 8)
+        hrp.CFrame = hrp.CFrame + dir * push
+
+    elseif S.AntiHitMode == "Teleport" then
+        -- Teleport jauh ke arah belakang player (evasive)
+        if tick() - AntiHitLastTP < 0.4 then return end
+        AntiHitLastTP = tick()
+        local dir = (hrp.Position - nearest.hrp.Position).Unit
+        local back = hrp.CFrame.LookVector * -1
+        local target = hrp.Position + (dir * 25) + (back * 10) + Vector3.new(0, 3, 0)
+        hrp.CFrame = CFrame.new(target)
+
+    elseif S.AntiHitMode == "Freeze" then
+        -- Freeze mister sebentar
+        pcall(function()
+            nearest.hum.WalkSpeed = 0
+            task.delay(0.5, function()
+                pcall(function() nearest.hum.WalkSpeed = 16 end)
+            end)
+        end)
+    end
+
+    -- I-Frame tambahan: HP tidak turun saat dekat mister
+    local h = GetHum()
+    if h and h.Health < h.MaxHealth then h.Health = h.MaxHealth end
+end
+
+-- ================================================================
+-- FLY (Android friendly)
+-- ================================================================
+local FlyBV, FlyBG
+local function ToggleFly(on)
+    S.Fly = on
+    local hrp = GetHRP()
+    if not hrp then return end
+    if on then
+        FlyBV = Instance.new("BodyVelocity", hrp)
+        FlyBV.MaxForce = Vector3.new(1e5,1e5,1e5)
+        FlyBV.Velocity = Vector3.zero
+        FlyBG = Instance.new("BodyGyro", hrp)
+        FlyBG.MaxTorque = Vector3.new(1e5,1e5,1e5)
+        FlyBG.P = 1000
+        FlyBG.CFrame = hrp.CFrame
+
+        RunService:BindToRenderStep("Fly", 100, function()
+            if not S.Fly or not FlyBV or not FlyBV.Parent then return end
+            local cam = Camera.CFrame
+            local move = Vector3.zero
+            local h = GetHum()
+            if h then
+                local mv = h.MoveDirection
+                if mv.Magnitude > 0 then
+                    move = cam:VectorToWorldSpace(mv) * S.FlySpeed
+                end
+                if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+                    move = move + Vector3.new(0, S.FlySpeed, 0)
+                end
+                if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+                    move = move - Vector3.new(0, S.FlySpeed, 0)
+                end
+            end
+            FlyBV.Velocity = move
+            FlyBG.CFrame = cam
+        end)
+    else
+        RunService:UnbindFromRenderStep("Fly")
+        pcall(function() if FlyBV then FlyBV:Destroy() end end)
+        pcall(function() if FlyBG then FlyBG:Destroy() end end)
+    end
+end
+
+-- ================================================================
+-- SCREEN GUI
 -- ================================================================
 local SG = Instance.new("ScreenGui")
-SG.Name           = "ANTS_V41"
+SG.Name           = "ANTS_V42"
 SG.ResetOnSpawn   = false
 SG.DisplayOrder   = 999
 SG.IgnoreGuiInset = true
@@ -169,17 +276,17 @@ local C = {
     BgDark  = Color3.fromRGB(10, 10, 10),
     Panel   = Color3.fromRGB(24, 24, 24),
     Panel2  = Color3.fromRGB(32, 32, 32),
-    Panel3  = Color3.fromRGB(40, 40, 40),
+    Panel3  = Color3.fromRGB(42, 42, 42),
     Border  = Color3.fromRGB(58, 58, 58),
     Accent  = Color3.fromRGB(200, 30, 30),
     Accent2 = Color3.fromRGB(255, 60, 60),
     Text    = Color3.fromRGB(230, 230, 230),
     TextDim = Color3.fromRGB(150, 150, 150),
     TextMut = Color3.fromRGB(90, 90, 90),
+    Good    = Color3.fromRGB(80, 200, 100),
 }
 
--- Ukuran khusus Android (compact)
-local MW, MH, SW = 400, 380, 110
+local MW, MH, SW = 400, 400, 110
 local CW = MW - SW
 
 -- ================================================================
@@ -187,37 +294,43 @@ local CW = MW - SW
 -- ================================================================
 local MF = Instance.new("Frame", SG)
 MF.Size             = UDim2.new(0, MW, 0, MH)
-MF.Position         = UDim2.new(0, -MW - 30, 0.5, -MH/2)
+MF.Position         = UDim2.new(0, 20, 0.5, -MH/2)
 MF.BackgroundColor3 = C.BgDark
 MF.BorderSizePixel  = 0
 MF.Active           = true
-MF.Visible          = false -- start hidden, animate in
+MF.Visible          = false
 Instance.new("UICorner", MF).CornerRadius = UDim.new(0, 4)
 
 local MFB = Instance.new("UIStroke", MF)
 MFB.Color = C.Border; MFB.Thickness = 1
 
 -- ================================================================
--- FLOATING ICON (Open/Close toggle) — Android friendly
+-- FLOATING ICON
 -- ================================================================
 local IconBtn = Instance.new("TextButton", SG)
-IconBtn.Size             = UDim2.new(0, 46, 0, 46)
-IconBtn.Position         = UDim2.new(0, 20, 0.5, -23)
+IconBtn.Size             = UDim2.new(0, 50, 0, 50)
+IconBtn.Position         = UDim2.new(0, 20, 0.5, -25)
 IconBtn.BackgroundColor3 = C.BgDark
 IconBtn.Text             = "🐜"
-IconBtn.TextSize         = 24
+IconBtn.TextSize         = 26
 IconBtn.Font             = Enum.Font.GothamBold
 IconBtn.BorderSizePixel  = 0
 IconBtn.AutoButtonColor  = false
 IconBtn.ZIndex           = 100
+IconBtn.Visible          = true
 Instance.new("UICorner", IconBtn).CornerRadius = UDim.new(1, 0)
 
 local IconStroke = Instance.new("UIStroke", IconBtn)
 IconStroke.Color = C.Accent; IconStroke.Thickness = 2
 
--- Icon drag (Android touch friendly)
+-- ================================================================
+-- FORWARD DECLARE (fix bug tombol ga bisa buka)
+-- ================================================================
+local TogglePanel, ShowPanel, HidePanel
+
+-- Drag icon
 do
-    local dragging, dragStart, startPos, moved
+    local dragging, dragStart, startPos, moved = false, nil, nil, false
     IconBtn.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -232,19 +345,20 @@ do
         if input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch then
             local d = input.Position - dragStart
-            if math.abs(d.X) > 5 or math.abs(d.Y) > 5 then moved = true end
-            IconBtn.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y
-            )
+            if math.abs(d.X) > 6 or math.abs(d.Y) > 6 then moved = true end
+            if moved then
+                IconBtn.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y
+                )
+            end
         end
     end)
     UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
             if dragging and not moved then
-                -- Tap → toggle panel
-                TogglePanel()
+                if TogglePanel then TogglePanel() end
             end
             dragging = false
         end
@@ -255,7 +369,7 @@ end
 -- TITLE BAR
 -- ================================================================
 local TitleBar = Instance.new("Frame", MF)
-TitleBar.Size             = UDim2.new(1, 0, 0, 28)
+TitleBar.Size             = UDim2.new(1, 0, 0, 30)
 TitleBar.BackgroundColor3 = C.Bg
 TitleBar.BorderSizePixel  = 0
 TitleBar.ZIndex           = 5
@@ -272,17 +386,16 @@ local TitleLbl = Instance.new("TextLabel", TitleBar)
 TitleLbl.Size             = UDim2.new(0.75, 0, 1, 0)
 TitleLbl.Position         = UDim2.new(0, 12, 0, 0)
 TitleLbl.BackgroundTransparency = 1
-TitleLbl.Text             = "🐜 ANTS TEAM  ::  v4.1"
+TitleLbl.Text             = "🐜 ANTS TEAM  ::  v4.2"
 TitleLbl.TextColor3       = C.Accent2
 TitleLbl.TextSize         = 13
 TitleLbl.Font             = Enum.Font.GothamBold
 TitleLbl.TextXAlignment   = Enum.TextXAlignment.Left
 TitleLbl.ZIndex           = 7
 
--- Minimize button (bukan close/exit)
 local MinBtn = Instance.new("TextButton", TitleBar)
 MinBtn.Size             = UDim2.new(0, 34, 0, 22)
-MinBtn.Position         = UDim2.new(1, -40, 0, 3)
+MinBtn.Position         = UDim2.new(1, -40, 0, 4)
 MinBtn.BackgroundColor3 = C.Panel2
 MinBtn.Text             = "—"
 MinBtn.TextColor3       = C.Text
@@ -292,11 +405,9 @@ MinBtn.BorderSizePixel  = 0
 MinBtn.ZIndex           = 8
 Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 3)
 
--- ================================================================
--- DRAG PANEL (title bar only biar ga bentrok scrolling)
--- ================================================================
+-- Drag panel
 do
-    local dragging, dragStart, startPos
+    local dragging, dragStart, startPos = false, nil, nil
     TitleBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -328,8 +439,8 @@ end
 -- SIDEBAR
 -- ================================================================
 local SB = Instance.new("Frame", MF)
-SB.Size             = UDim2.new(0, SW, 1, -28)
-SB.Position         = UDim2.new(0, 0, 0, 28)
+SB.Size             = UDim2.new(0, SW, 1, -30)
+SB.Position         = UDim2.new(0, 0, 0, 30)
 SB.BackgroundColor3 = C.Bg
 SB.BorderSizePixel  = 0
 SB.ZIndex           = 3
@@ -341,14 +452,13 @@ SBLine.BackgroundColor3 = C.Border
 SBLine.BorderSizePixel  = 0
 SBLine.ZIndex           = 3
 
--- Logo header
 local LogoArea = Instance.new("Frame", SB)
 LogoArea.Size             = UDim2.new(1, 0, 0, 52)
 LogoArea.BackgroundColor3 = C.BgDark
 LogoArea.BorderSizePixel  = 0
 LogoArea.ZIndex           = 4
 
-local LOGO_ASSET = "rbxassetid://12640721857" -- ganti dengan ID logo kamu
+local LOGO_ASSET = "rbxassetid://12640721857"
 local LogoImg = Instance.new("ImageLabel", LogoArea)
 LogoImg.Size                = UDim2.new(0, 32, 0, 32)
 LogoImg.Position            = UDim2.new(0, 10, 0.5, -16)
@@ -385,7 +495,7 @@ local LogoSub = Instance.new("TextLabel", LogoArea)
 LogoSub.Size             = UDim2.new(1, -50, 0, 12)
 LogoSub.Position         = UDim2.new(0, 48, 0, 28)
 LogoSub.BackgroundTransparency = 1
-LogoSub.Text             = "steal an egg"
+LogoSub.Text             = "v4.2 mobile"
 LogoSub.TextColor3       = C.TextMut
 LogoSub.TextSize         = 10
 LogoSub.Font             = Enum.Font.Gotham
@@ -399,7 +509,6 @@ Sep.BackgroundColor3 = C.Border
 Sep.BorderSizePixel  = 0
 Sep.ZIndex           = 4
 
--- Tab container (scrollable buat layar kecil)
 local TabScroll = Instance.new("ScrollingFrame", SB)
 TabScroll.Size             = UDim2.new(1, 0, 1, -52)
 TabScroll.Position         = UDim2.new(0, 0, 0, 52)
@@ -419,15 +528,15 @@ TLayout.SortOrder = Enum.SortOrder.LayoutOrder
 -- CONTENT
 -- ================================================================
 local CA = Instance.new("Frame", MF)
-CA.Size             = UDim2.new(0, CW, 1, -28)
-CA.Position         = UDim2.new(0, SW, 0, 28)
+CA.Size             = UDim2.new(0, CW, 1, -30)
+CA.Position         = UDim2.new(0, SW, 0, 30)
 CA.BackgroundColor3 = C.BgDark
 CA.BorderSizePixel  = 0
 CA.ClipsDescendants = true
 CA.ZIndex           = 2
 
 -- ================================================================
--- TAB SYSTEM
+-- TABS
 -- ================================================================
 local Pages, TabBtns = {}, {}
 
@@ -554,7 +663,6 @@ local function Spacer(parent, h, order)
     f.LayoutOrder      = order
 end
 
--- ANDROID CHECKBOX (tap area lebih besar)
 local function NewCheckbox(parent, label, order, default, cb)
     local row = Instance.new("Frame", parent)
     row.Size             = UDim2.new(1, 0, 0, 32)
@@ -597,30 +705,19 @@ local function NewCheckbox(parent, label, order, default, cb)
     btn.AutoButtonColor  = false
 
     local on = default or false
+    if on then box.BackgroundColor3 = C.Accent; box.BorderColor3 = C.Accent end
 
     btn.Activated:Connect(function()
         on = not on
         check.Visible = on
-        if on then
-            box.BackgroundColor3 = C.Accent
-            box.BorderColor3     = C.Accent
-        else
-            box.BackgroundColor3 = C.Panel2
-            box.BorderColor3     = C.Border
-        end
+        box.BackgroundColor3 = on and C.Accent or C.Panel2
+        box.BorderColor3     = on and C.Accent or C.Border
         cb(on)
     end)
-
-    -- Init visual state
-    if on then
-        box.BackgroundColor3 = C.Accent
-        box.BorderColor3     = C.Accent
-    end
 
     return function() return on end
 end
 
--- ANDROID SLIDER (touch friendly, thumb lebih besar)
 local function NewSlider(parent, label, order, minV, maxV, def, cb)
     local row = Instance.new("Frame", parent)
     row.Size             = UDim2.new(1, 0, 0, 46)
@@ -649,7 +746,6 @@ local function NewSlider(parent, label, order, minV, maxV, def, cb)
     valL.Font             = Enum.Font.GothamBold
     valL.TextXAlignment   = Enum.TextXAlignment.Right
 
-    -- Track lebih tebal & thumb besar (buat jari)
     local track = Instance.new("Frame", row)
     track.Size             = UDim2.new(1, -24, 0, 6)
     track.Position         = UDim2.new(0, 12, 0, 30)
@@ -720,6 +816,50 @@ local function NewSlider(parent, label, order, minV, maxV, def, cb)
     return function() return cur end
 end
 
+local function NewDropdown(parent, label, order, options, def, cb)
+    local row = Instance.new("Frame", parent)
+    row.Size             = UDim2.new(1, 0, 0, 60)
+    row.BackgroundColor3 = C.Panel
+    row.BorderSizePixel  = 0
+    row.LayoutOrder      = order
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 3)
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size             = UDim2.new(1, -20, 0, 16)
+    lbl.Position         = UDim2.new(0, 10, 0, 6)
+    lbl.BackgroundTransparency = 1
+    lbl.Text             = label
+    lbl.TextColor3       = C.Text
+    lbl.TextSize         = 12
+    lbl.Font             = Enum.Font.Gotham
+    lbl.TextXAlignment   = Enum.TextXAlignment.Left
+
+    local cur = def
+    local btn = Instance.new("TextButton", row)
+    btn.Size             = UDim2.new(1, -20, 0, 26)
+    btn.Position         = UDim2.new(0, 10, 0, 26)
+    btn.BackgroundColor3 = C.Panel2
+    btn.Text             = cur
+    btn.TextColor3       = C.Accent2
+    btn.TextSize         = 12
+    btn.Font             = Enum.Font.GothamBold
+    btn.BorderSizePixel  = 0
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 3)
+
+    local idx = 1
+    for i, o in ipairs(options) do if o == cur then idx = i end end
+
+    btn.Activated:Connect(function()
+        idx = idx + 1
+        if idx > #options then idx = 1 end
+        cur = options[idx]
+        btn.Text = cur
+        cb(cur)
+    end)
+
+    return function() return cur end
+end
+
 local function InfoLine(parent, key, order)
     local row = Instance.new("Frame", parent)
     row.Size             = UDim2.new(1, 0, 0, 26)
@@ -752,7 +892,7 @@ local function InfoLine(parent, key, order)
 end
 
 -- ================================================================
--- TABS
+-- BUILD TABS
 -- ================================================================
 NewTabBtn("Home",   "H", "Dashboard")
 NewTabBtn("Combat", "C", "Combat")
@@ -768,7 +908,9 @@ local PESP    = NewPage("ESP")
 local PMove   = NewPage("Move")
 local PMisc   = NewPage("Misc")
 
+-- ================================================================
 -- HOME
+-- ================================================================
 SectionLabel(PHome, "Session", 1)
 local vEggs    = InfoLine(PHome, "Eggs", 2)
 local vEarned  = InfoLine(PHome, "Earned", 3)
@@ -782,29 +924,31 @@ local vPing    = InfoLine(PHome, "Ping", 10)
 local vEggsMap = InfoLine(PHome, "Eggs on Map", 11)
 local vMisters = InfoLine(PHome, "Misters", 12)
 
+-- ================================================================
 -- COMBAT
-SectionLabel(PCombat, "Anti Hit", 1)
-NewCheckbox(PCombat, "Anti-Hit (auto dodge)", 2, false, function(on)
+-- ================================================================
+SectionLabel(PCombat, "Anti Hit (Smart)", 1)
+
+NewCheckbox(PCombat, "Anti-Hit (auto dodge mister)", 2, false, function(on)
     S.AntiHit = on
     RunService:UnbindFromRenderStep("AntiHit")
     if on then
-        RunService:BindToRenderStep("AntiHit", 200, function()
-            if not S.AntiHit then return end
-            local hrp = GetHRP(); if not hrp then return end
-            for _, m in ipairs(ScanMisters()) do
-                if m.hrp and m.hrp.Parent then
-                    local d = (m.hrp.Position - hrp.Position).Magnitude
-                    if d < S.AntiHitRange then
-                        local dir = (hrp.Position - m.hrp.Position).Unit
-                        hrp.CFrame = hrp.CFrame + dir * (S.AntiHitRange - d + 18)
-                    end
-                end
-            end
-        end)
+        RunService:BindToRenderStep("AntiHit", 200, DoAntiHit)
     end
 end)
 
-NewCheckbox(PCombat, "Freeze Mister", 3, false, function(on)
+NewDropdown(PCombat, "Anti-Hit Mode", 3, {"Dodge","Teleport","Freeze"}, "Dodge", function(v)
+    S.AntiHitMode = v
+end)
+
+NewSlider(PCombat, "Anti-Hit Range", 4, 10, 100, 35, function(v)
+    S.AntiHitRange = v
+end)
+
+Spacer(PCombat, 5, 5)
+SectionLabel(PCombat, "Mister", 6)
+
+NewCheckbox(PCombat, "Freeze Mister", 7, false, function(on)
     S.FreezeMister = on
     RunService:UnbindFromRenderStep("FreezeMister")
     if on then
@@ -821,10 +965,29 @@ NewCheckbox(PCombat, "Freeze Mister", 3, false, function(on)
     end
 end)
 
-Spacer(PCombat, 4, 4)
-SectionLabel(PCombat, "Player", 5)
+NewCheckbox(PCombat, "Kill Aura (damage mister)", 8, false, function(on)
+    S.KillAura = on
+    RunService:UnbindFromRenderStep("KillAura")
+    if on then
+        RunService:BindToRenderStep("KillAura", 300, function()
+            if not S.KillAura then return end
+            local hrp = GetHRP(); if not hrp then return end
+            for _, m in ipairs(ScanMisters()) do
+                if m.hrp and m.hrp.Parent then
+                    local d = (m.hrp.Position - hrp.Position).Magnitude
+                    if d < S.KillAuraRange then
+                        pcall(function() m.hum:TakeDamage(9999) end)
+                    end
+                end
+            end
+        end)
+    end
+end)
 
-NewCheckbox(PCombat, "Godmode", 6, false, function(on)
+Spacer(PCombat, 9, 9)
+SectionLabel(PCombat, "Player", 10)
+
+NewCheckbox(PCombat, "Godmode (HP loop)", 11, false, function(on)
     S.Godmode = on
     RunService:UnbindFromRenderStep("Godmode")
     if on then
@@ -834,7 +997,7 @@ NewCheckbox(PCombat, "Godmode", 6, false, function(on)
     end
 end)
 
-NewCheckbox(PCombat, "Anti Touch", 7, false, function(on)
+NewCheckbox(PCombat, "Anti Touch", 12, false, function(on)
     S.AntiTouch = on
     RunService:UnbindFromRenderStep("AntiTouch")
     if on then
@@ -852,7 +1015,23 @@ NewCheckbox(PCombat, "Anti Touch", 7, false, function(on)
     end
 end)
 
--- STEAL (FITUR UTAMA)
+NewCheckbox(PCombat, "Anti Void (auto TP kalau jatuh)", 13, false, function(on)
+    S.AntiVoid = on
+    RunService:UnbindFromRenderStep("AntiVoid")
+    if on then
+        RunService:BindToRenderStep("AntiVoid", 200, function()
+            local hrp = GetHRP(); if not hrp then return end
+            if hrp.Position.Y < -50 then
+                local base = ScanBase()
+                if base then hrp.CFrame = CFrame.new(base.Position + Vector3.new(0, 5, 0)) end
+            end
+        end)
+    end
+end)
+
+-- ================================================================
+-- STEAL
+-- ================================================================
 SectionLabel(PSteal, "Auto Steal Egg", 1)
 
 NewCheckbox(PSteal, "Auto Steal Terdekat", 2, false, function(on)
@@ -866,7 +1045,7 @@ NewCheckbox(PSteal, "Auto Steal Terdekat", 2, false, function(on)
             for _, obj in ipairs(ScanEggs()) do
                 if obj.Parent then
                     local d = (obj.Position - hrp.Position).Magnitude
-                    if d < bd then bd = d; best = obj end
+                    if d < bd and d < S.AutoStealDist then bd = d; best = obj end
                 end
             end
             if best then
@@ -879,30 +1058,48 @@ NewCheckbox(PSteal, "Auto Steal Terdekat", 2, false, function(on)
     end
 end)
 
-NewCheckbox(PSteal, "Reach (steal dari jauh)", 3, true, function(on)
+NewSlider(PSteal, "Max Distance", 3, 20, 300, 120, function(v)
+    S.AutoStealDist = v
+end)
+
+NewCheckbox(PSteal, "Reach (steal dari jauh)", 4, true, function(on)
     S.ReachEnabled = on
-    -- Metatable patch
     local mt = getrawmetatable and getrawmetatable(game)
-    if mt and setreadonly then
-        if not S._mtPatched then
-            S._mtPatched = true
-            local oldIdx = mt.__index
-            setreadonly(mt, false)
-            mt.__index = newcclosure(function(self, k)
-                if S.ReachEnabled and k == "MaxActivationDistance" and typeof(self) == "Instance" and self:IsA("ProximityPrompt") then
-                    return 32
-                end
-                return oldIdx(self, k)
-            end)
-            setreadonly(mt, true)
-        end
+    if mt and setreadonly and not S._mtPatched then
+        S._mtPatched = true
+        local oldIdx = mt.__index
+        setreadonly(mt, false)
+        mt.__index = newcclosure(function(self, k)
+            if S.ReachEnabled and k == "MaxActivationDistance"
+            and typeof(self) == "Instance" and self:IsA("ProximityPrompt") then
+                return 32
+            end
+            return oldIdx(self, k)
+        end)
+        setreadonly(mt, true)
     end
 end)
 
-Spacer(PSteal, 4, 4)
-SectionLabel(PSteal, "Auto TP Base", 5)
+NewCheckbox(PSteal, "Auto Collect Semua Egg", 5, false, function(on)
+    S.AutoCollectAll = on
+    RunService:UnbindFromRenderStep("CollectAll")
+    if on then
+        RunService:BindToRenderStep("CollectAll", 500, function()
+            if not S.AutoCollectAll then return end
+            for _, obj in ipairs(ScanEggs()) do
+                if obj.Parent then
+                    local pp = FindPrompt(obj)
+                    if pp then FirePrompt(pp) end
+                end
+            end
+        end)
+    end
+end)
 
-NewCheckbox(PSteal, "Auto TP Base (bawa egg)", 6, false, function(on)
+Spacer(PSteal, 6, 6)
+SectionLabel(PSteal, "Auto TP Base", 7)
+
+NewCheckbox(PSteal, "Auto TP Base (bawa egg)", 8, false, function(on)
     S.AutoTP = on
     RunService:UnbindFromRenderStep("AutoTP")
     if on then
@@ -934,7 +1131,7 @@ NewCheckbox(PSteal, "Auto TP Base (bawa egg)", 6, false, function(on)
     end
 end)
 
-NewCheckbox(PSteal, "TP ke Base Sekarang", 7, false, function(on)
+NewCheckbox(PSteal, "TP ke Base Sekarang", 9, false, function(on)
     if on then
         local base = ScanBase()
         local hrp = GetHRP()
@@ -947,24 +1144,10 @@ NewCheckbox(PSteal, "TP ke Base Sekarang", 7, false, function(on)
     end
 end)
 
-Spacer(PSteal, 8, 8)
-SectionLabel(PSteal, "Info", 9)
-local InfoTxt = Instance.new("TextLabel", PSteal)
-InfoTxt.Size             = UDim2.new(1, -4, 0, 76)
-InfoTxt.BackgroundColor3 = C.Panel
-InfoTxt.BorderSizePixel  = 0
-InfoTxt.Text             = "  Auto Steal:\n  1. Cari egg terdekat\n  2. TP ke atas egg\n  3. Fire prompt (bypass jarak)\n\n  Reach 32 = ambil dari jauh."
-InfoTxt.TextColor3       = C.TextMut
-InfoTxt.TextSize         = 10
-InfoTxt.Font             = Enum.Font.Gotham
-InfoTxt.TextWrapped      = true
-InfoTxt.TextXAlignment   = Enum.TextXAlignment.Left
-InfoTxt.TextYAlignment   = Enum.TextYAlignment.Top
-InfoTxt.LayoutOrder      = 10
-Instance.new("UICorner", InfoTxt).CornerRadius = UDim.new(0, 3)
-
+-- ================================================================
 -- ESP
-local EggESPList, MisterESPList = {}, {}
+-- ================================================================
+local EggESPList, MisterESPList, PlayerESPList = {}, {}, {}
 
 local function ClearESP(list)
     for _, v in ipairs(list) do pcall(function() v:Destroy() end) end
@@ -1005,6 +1188,23 @@ local function BuildMisterESP()
     end
 end
 
+local function BuildPlayerESP()
+    ClearESP(PlayerESPList)
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LP and pl.Character then
+            local hl = Instance.new("Highlight")
+            hl.Adornee = pl.Character
+            hl.FillColor = Color3.fromRGB(80, 200, 255)
+            hl.OutlineColor = Color3.fromRGB(200, 240, 255)
+            hl.FillTransparency = 0.6
+            hl.OutlineTransparency = 0.1
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Parent = SG
+            table.insert(PlayerESPList, hl)
+        end
+    end
+end
+
 SectionLabel(PESP, "Egg ESP", 1)
 NewCheckbox(PESP, "Egg ESP (kotak emas)", 2, false, function(on)
     S.EggESP = on
@@ -1036,14 +1236,53 @@ NewCheckbox(PESP, "Mister ESP (highlight)", 5, false, function(on)
     end
 end)
 
+Spacer(PESP, 6, 6)
+SectionLabel(PESP, "Player ESP", 7)
+NewCheckbox(PESP, "Player ESP (highlight)", 8, false, function(on)
+    S.PlayerESP = on
+    RunService:UnbindFromRenderStep("PlyESPLoop")
+    if on then
+        BuildPlayerESP()
+        local last = 0
+        RunService:BindToRenderStep("PlyESPLoop", 2, function()
+            if tick() - last > 1.5 then last = tick(); BuildPlayerESP() end
+        end)
+    else
+        ClearESP(PlayerESPList)
+    end
+end)
+
+Spacer(PESP, 9, 9)
+SectionLabel(PESP, "Lighting", 10)
+NewCheckbox(PESP, "Fullbright", 11, false, function(on)
+    S.Fullbright = on
+    if on then
+        S._origBr = Lighting.Brightness
+        S._origAmb = Lighting.Ambient
+        S._origOut = Lighting.OutdoorAmbient
+        S._origClock = Lighting.ClockTime
+        Lighting.Brightness = 3
+        Lighting.Ambient = Color3.fromRGB(200,200,200)
+        Lighting.OutdoorAmbient = Color3.fromRGB(200,200,200)
+        Lighting.ClockTime = 12
+    else
+        Lighting.Brightness = S._origBr or 2
+        if S._origAmb then Lighting.Ambient = S._origAmb end
+        if S._origOut then Lighting.OutdoorAmbient = S._origOut end
+        if S._origClock then Lighting.ClockTime = S._origClock end
+    end
+end)
+
+-- ================================================================
 -- MOVE
+-- ================================================================
 SectionLabel(PMove, "Speed", 1)
-NewSlider(PMove, "Target Speed", 2, 16, 120, 24, function(v)
+NewSlider(PMove, "Target Speed", 2, 16, 150, 24, function(v)
     S.SpeedValue = v
     if S.SpeedHack then S.TargetSpeed = v end
 end)
 
-NewCheckbox(PMove, "Speed Bypass", 3, false, function(on)
+NewCheckbox(PMove, "Speed Bypass (smooth ramp)", 3, false, function(on)
     S.SpeedHack = on
     RunService:UnbindFromRenderStep("SpeedBypass")
     if on then
@@ -1067,10 +1306,25 @@ NewCheckbox(PMove, "Speed Bypass", 3, false, function(on)
     end
 end)
 
-Spacer(PMove, 4, 4)
-SectionLabel(PMove, "Movement", 5)
+NewSlider(PMove, "Jump Power", 4, 50, 300, 80, function(v)
+    S.JumpValue = v
+    if S.JumpPower then
+        local h = GetHum(); if h then h.JumpPower = v; h.UseJumpPower = true end
+    end
+end)
 
-NewCheckbox(PMove, "No-Clip", 6, false, function(on)
+NewCheckbox(PMove, "Custom Jump Power", 5, false, function(on)
+    S.JumpPower = on
+    local h = GetHum(); if h then
+        if on then h.UseJumpPower = true; h.JumpPower = S.JumpValue
+        else h.JumpPower = 50 end
+    end
+end)
+
+Spacer(PMove, 6, 6)
+SectionLabel(PMove, "Movement", 7)
+
+NewCheckbox(PMove, "No-Clip", 8, false, function(on)
     S.NoClip = on
     RunService:UnbindFromRenderStep("NoClip")
     if on then
@@ -1083,7 +1337,7 @@ NewCheckbox(PMove, "No-Clip", 6, false, function(on)
     end
 end)
 
-NewCheckbox(PMove, "Infinite Jump", 7, false, function(on) S.InfJump = on end)
+NewCheckbox(PMove, "Infinite Jump", 9, false, function(on) S.InfJump = on end)
 
 UserInputService.JumpRequest:Connect(function()
     if S.InfJump then
@@ -1091,19 +1345,26 @@ UserInputService.JumpRequest:Connect(function()
     end
 end)
 
+NewCheckbox(PMove, "Fly (Space=up, Shift=down)", 10, false, function(on)
+    ToggleFly(on)
+end)
+
+NewSlider(PMove, "Fly Speed", 11, 20, 300, 50, function(v)
+    S.FlySpeed = v
+end)
+
+-- ================================================================
 -- MISC
+-- ================================================================
 SectionLabel(PMisc, "Graphics", 1)
 NewCheckbox(PMisc, "Low Graphics (FPS Boost)", 2, false, function(on)
     S.LowGfx = on
     if on then
         S._origGS = Lighting.GlobalShadows
-        S._origBr = Lighting.Brightness
-        S._origFog = Lighting.FogEnd
         pcall(function() S._origQ = settings().Rendering.QualityLevel end)
         pcall(function() settings().Rendering.QualityLevel = 1 end)
         Lighting.GlobalShadows = false
         Lighting.FogEnd = 9e9
-        Lighting.Brightness = 2.5
         for _, obj in ipairs(workspace:GetDescendants()) do
             if obj:IsA("ParticleEmitter") or obj:IsA("Fire") or obj:IsA("Smoke")
             or obj:IsA("Sparkles") or obj:IsA("Trail") then obj.Enabled = false end
@@ -1111,24 +1372,64 @@ NewCheckbox(PMisc, "Low Graphics (FPS Boost)", 2, false, function(on)
         end
     else
         Lighting.GlobalShadows = S._origGS or true
-        Lighting.Brightness = S._origBr or 2
-        Lighting.FogEnd = S._origFog or 100000
         pcall(function() settings().Rendering.QualityLevel = S._origQ or 10 end)
     end
 end)
 
-NewCheckbox(PMisc, "Remove Shadows", 3, false, function(on)
-    Lighting.GlobalShadows = not on
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") then obj.CastShadow = not on end
+NewCheckbox(PMisc, "No Fog", 3, false, function(on)
+    S.NoFog = on
+    if on then
+        S._origFogEnd = Lighting.FogEnd
+        S._origFogStart = Lighting.FogStart
+        Lighting.FogEnd = 9e9
+        Lighting.FogStart = 9e9
+    else
+        Lighting.FogEnd = S._origFogEnd or 100000
+        Lighting.FogStart = S._origFogStart or 0
     end
 end)
 
 NewCheckbox(PMisc, "Hide Chat", 4, false, function(on)
+    S.HideChat = on
     pcall(function()
         local ch = LP.PlayerGui:FindFirstChild("Chat")
         if ch then ch.Enabled = not on end
     end)
+end)
+
+Spacer(PMisc, 5, 5)
+SectionLabel(PMisc, "Server", 6)
+
+NewCheckbox(PMisc, "Server Hop (pindah server)", 7, false, function(on)
+    if on then
+        local TS = game:GetService("TeleportService")
+        local HttpService = game:GetService("HttpService")
+        task.spawn(function()
+            pcall(function()
+                local req = (syn and syn.request) or (http and http.request) or http_request
+                if not req then return end
+                local res = req({
+                    Url = "https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?limit=100",
+                    Method = "GET",
+                })
+                local body = HttpService:JSONDecode(res.Body)
+                local servers = body.data
+                for _, srv in ipairs(servers) do
+                    if srv.id ~= game.JobId and srv.playing < srv.maxPlayers then
+                        TS:TeleportToPlaceInstance(game.PlaceId, srv.id, LP)
+                        break
+                    end
+                end
+            end)
+        end)
+    end
+end)
+
+NewCheckbox(PMisc, "Rejoin Server", 8, false, function(on)
+    if on then
+        local TS = game:GetService("TeleportService")
+        pcall(function() TS:Teleport(game.PlaceId, LP) end)
+    end
 end)
 
 -- ================================================================
@@ -1142,70 +1443,79 @@ end)
 
 task.spawn(function()
     while SG.Parent do
-        local eggs = GetEggs()
-        if S.EggsStart == 0 and eggs ~= 0 then S.EggsStart = eggs end
-        if vEggs    then vEggs.Text    = tostring(eggs) end
-        if vEarned  then vEarned.Text  = "+"..tostring(math.max(0, eggs - S.EggsStart)) end
-        if vRank    then vRank.Text    = GetRank() end
-        if vTime    then vTime.Text    = FormatTime(tick() - S.SessionStart) end
-        if vPlayers then vPlayers.Text = #Players:GetPlayers().."/"..Players.MaxPlayers end
-        if vFPS     then vFPS.Text     = fpsN.." fps" end
-        if vPing    then pcall(function() vPing.Text = math.floor(LP:GetNetworkPing()*1000).." ms" end) end
-        if vEggsMap then vEggsMap.Text = #ScanEggs().." eggs" end
-        if vMisters then vMisters.Text = #ScanMisters().." alive" end
+        local ok, err = pcall(function()
+            local eggs = GetEggs()
+            if S.EggsStart == 0 and eggs ~= 0 then S.EggsStart = eggs end
+            if vEggs    then vEggs.Text    = tostring(eggs) end
+            if vEarned  then vEarned.Text  = "+"..tostring(math.max(0, eggs - S.EggsStart)) end
+            if vRank    then vRank.Text    = GetRank() end
+            if vTime    then vTime.Text    = FormatTime(tick() - S.SessionStart) end
+            if vPlayers then vPlayers.Text = #Players:GetPlayers().."/"..Players.MaxPlayers end
+            if vFPS     then vFPS.Text     = fpsN.." fps" end
+            if vPing    then pcall(function() vPing.Text = math.floor(LP:GetNetworkPing()*1000).." ms" end) end
+            if vEggsMap then vEggsMap.Text = #ScanEggs().." eggs" end
+            if vMisters then vMisters.Text = #ScanMisters().." alive" end
+        end)
         task.wait(0.5)
     end
 end)
 
 -- ================================================================
--- TOGGLE PANEL (MINIMIZE / RESTORE) — bukan exit
+-- PANEL TOGGLE (FIXED)
 -- ================================================================
-function TogglePanel()
-    S.Minimized = not S.Minimized
-    if S.Minimized then
-        -- Hide panel, show icon
-        TweenService:Create(MF, TweenInfo.new(0.22, Enum.EasingStyle.Quad), {
-            Position = UDim2.new(MF.Position.X.Scale, MF.Position.X.Offset, MF.Position.Y.Scale, MF.Position.Y.Offset + 200),
-        }):Play()
-        task.delay(0.22, function() MF.Visible = false end)
+local PanelTweening = false
+
+ShowPanel = function()
+    if MF.Visible and not S.Minimized then return end
+    S.Minimized = false
+    IconBtn.Visible = false
+    MF.Visible = true
+    MF.Position = UDim2.new(0, -MW - 30, 0.5, -MH/2)
+    TweenService:Create(MF, TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0, 20, 0.5, -MH/2),
+    }):Play()
+end
+
+HidePanel = function()
+    if not MF.Visible then return end
+    S.Minimized = true
+    TweenService:Create(MF, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+        Position = UDim2.new(0, -MW - 30, 0.5, -MH/2),
+    }):Play()
+    task.delay(0.22, function()
+        MF.Visible = false
         IconBtn.Visible = true
-        IconBtn.Text = "🐜"
+    end)
+end
+
+TogglePanel = function()
+    if PanelTweening then return end
+    PanelTweening = true
+    task.delay(0.32, function() PanelTweening = false end)
+    if S.Minimized then
+        ShowPanel()
     else
-        MF.Visible = true
-        TweenService:Create(MF, TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            Position = UDim2.new(MF.Position.X.Scale, MF.Position.X.Offset, MF.Position.Y.Scale, MF.Position.Y.Offset - 200),
-        }):Play()
-        IconBtn.Visible = false
+        HidePanel()
     end
 end
 
--- Minimize button
-MinBtn.Activated:Connect(function()
-    S.Minimized = true
-    MF.Visible = false
-    IconBtn.Visible = true
+MinBtn.Activated:Connect(HidePanel)
+
+-- ================================================================
+-- KEYBIND (buat PC juga)
+-- ================================================================
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    if inp.KeyCode == Enum.KeyCode.RightShift then
+        TogglePanel()
+    end
 end)
 
 -- ================================================================
 -- INIT
 -- ================================================================
 SwitchTab("Home")
-
--- Panel mulai tersembunyi, icon terlihat
-MF.Position = UDim2.new(0, 20, 0.5, -MH/2)
-MF.Visible = false
-IconBtn.Visible = true
-
--- Auto show panel pertama kali
-task.spawn(function()
-    task.wait(0.3)
-    MF.Visible = true
-    IconBtn.Visible = false
-    MF.Position = UDim2.new(0, -MW - 30, 0.5, -MH/2)
-    TweenService:Create(MF, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Position = UDim2.new(0, 20, 0.5, -MH/2),
-    }):Play()
-end)
+ShowPanel()
 
 -- Toast
 task.spawn(function()
@@ -1221,7 +1531,7 @@ task.spawn(function()
     local tl = Instance.new("TextLabel", toast)
     tl.Size = UDim2.new(1, 0, 1, 0)
     tl.BackgroundTransparency = 1
-    tl.Text = "🐜 ANTS v4.1 loaded · tap icon untuk hide"
+    tl.Text = "🐜 ANTS v4.2 · tap 🐜 untuk hide"
     tl.TextColor3 = C.Text
     tl.TextSize = 12
     tl.Font = Enum.Font.GothamBold
@@ -1237,4 +1547,4 @@ task.spawn(function()
     task.delay(0.25, function() toast:Destroy() end)
 end)
 
-print("[ANTS v4.1] Android edition loaded · Tap icon 🐜 untuk toggle")
+print("[ANTS v4.2] Loaded · Tap 🐜 untuk buka/tutup panel")
